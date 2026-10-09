@@ -64,10 +64,10 @@ async function readUser(req, res, next) {
         'Metering devices are write-only clients'
       );
     }
-    if (user.role === 'ADMIN' && (user.jurisdictionType !== 'NATIONAL' || user.jurisdictionRef)) throw forbidden();
+    if (['ADMIN', 'SYSTEM_ADMIN'].includes(user.role) && (user.jurisdictionType !== 'NATIONAL' || user.jurisdictionRef)) throw forbidden();
     let districtFilter = {};
     let substationFilter = {};
-    if (user.role !== 'ADMIN') {
+    if (!['ADMIN', 'SYSTEM_ADMIN'].includes(user.role)) {
       const expected = {
         PROVINCE_OFFICER: 'PROVINCE',
         DISTRICT_OFFICER: 'DISTRICT',
@@ -100,7 +100,7 @@ async function readUser(req, res, next) {
       .select('_id')
       .lean();
     let provinces;
-    if (user.role === 'ADMIN')
+    if (['ADMIN', 'SYSTEM_ADMIN'].includes(user.role))
       provinces = await Province.find().select('_id').lean();
     else if (user.jurisdictionType === 'PROVINCE')
       provinces = await Province.find({ _id: user.jurisdictionRef })
@@ -119,7 +119,7 @@ async function readUser(req, res, next) {
 }
 
 async function canAccessInstallation(auth, installation) {
-  if (auth.role === 'ADMIN') return true;
+  if (['ADMIN', 'SYSTEM_ADMIN'].includes(auth.role)) return true;
   if (auth.role === 'DEVICE')
     return (
       auth.jurisdictionType === 'INSTALLATION' &&

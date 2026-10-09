@@ -97,6 +97,7 @@ const userSchema = new Schema(
         type: String,
         enum: [
           'ADMIN',
+          'SYSTEM_ADMIN',
           'PROVINCE_OFFICER',
           'DISTRICT_OFFICER',
           'SUBSTATION_OFFICER',
@@ -130,6 +131,7 @@ const userSchema = new Schema(
 userSchema.pre('validate', function () {
   const expected = {
     ADMIN: ['NATIONAL', undefined],
+    SYSTEM_ADMIN: ['NATIONAL', undefined],
     PROVINCE_OFFICER: ['PROVINCE', 'Province'],
     DISTRICT_OFFICER: ['DISTRICT', 'District'],
     SUBSTATION_OFFICER: ['SUBSTATION', 'GridSubstation'],

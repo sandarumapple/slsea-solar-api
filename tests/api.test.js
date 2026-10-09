@@ -753,8 +753,8 @@ test('automatic scope endpoints require readers and reject attempted query overr
     assert.equal(overridden.status, 400);
     assert.equal(overridden.body.code, 'VALIDATION_ERROR');
     const mutation = await request(path, { method: 'POST', body: {} });
-    assert.equal(mutation.status, 405);
-    assert.match(mutation.headers.get('allow'), /GET/);
+    assert.equal(mutation.status, path === '/me' ? 405 : 403);
+    if (path === '/me') assert.match(mutation.headers.get('allow'), /GET/);
   }
   assert.equal((await request(`/districts/${d2.id}`, { role: 'district' })).status, 403);
 });
@@ -793,5 +793,173 @@ test('reader context has empty conditional 304 and denies missing assigned juris
     assert.equal(missing.body.code, 'FORBIDDEN');
   } finally {
     await User.updateOne({ email: 'district@test.lk' }, { jurisdictionRef: d1._id });
+  }
+});
+
+test('management CRUD, permissions, validation, replacement and preconditions', async () => {
+  const system = await User.create({ name: 'Management', email: 'system@test.lk', passwordHash: await bcrypt.hash('TestPass123!', 4), role: 'SYSTEM_ADMIN', jurisdictionType: 'NATIONAL' });
+  tokens.system = require('jsonwebtoken').sign({}, process.env.JWT_SECRET, { subject: system.id, expiresIn: '1h' });
+  const manage = (path, method, body, headers = {}) => request(path, { role: 'system', method, body, headers });
+  const rows = [
+    ['provinces', { name: 'CRUD province', code: 'CRUD-P' }],
+    ['districts', { name: 'CRUD district', province: p1.id }],
+    ['substations', { name: 'CRUD grid', code: 'CRUD-S', district: d1.id }],
+    ['installations', { installationId: 'CRUD-I', ownerName: 'CRUD owner', meterId: 'CRUD-M', inverterId: 'CRUD-V', capacityKw: 5, substation: s1.id, active: true }]
+  ];
+  for (const [resource, body] of rows) {
+    for (const role of ['admin', 'province', 'district', 'substation', 'device', 'none']) {
+      const denied = await request(`/${resource}`, { role, method: 'POST', body });
+      assert.equal(denied.status, role === 'none' ? 401 : 403);
+    }
+    assert.equal((await manage(`/${resource}`, 'POST', {})).status, 400);
+    assert.equal((await manage(`/${resource}`, 'POST', { ...body, _id: p1.id })).status, 400);
+    const created = await manage(`/${resource}`, 'POST', body);
+    assert.equal(created.status, 201);
+    const path = created.headers.get('location').replace(/^\/api/, '');
+    for (const role of ['admin', 'province', 'district', 'substation', 'device'])
+      for (const method of ['PUT', 'PATCH', 'DELETE'])
+        assert.equal((await request(path, { role, method, ...(method === 'DELETE' ? {} : { body }) })).status, 403);
+    const first = await request(path, { role: 'system' });
+    const patch = resource === 'installations' ? { ownerName: 'Changed owner' } : { name: 'Changed name' };
+    assert.equal((await manage(path, 'PATCH', patch, { 'If-Match': first.headers.get('etag') })).status, 200);
+    assert.equal((await manage(path, 'PATCH', patch, { 'If-Match': first.headers.get('etag') })).status, 412);
+    const after = await request(path, { role: 'system' });
+    assert.notEqual(after.headers.get('etag'), first.headers.get('etag'));
+    assert.equal((await manage(path, 'PATCH', patch, { 'If-Unmodified-Since': 'Sat, 01 Jan 2000 00:00:00 GMT' })).status, 412);
+    assert.equal((await request(path, { role: 'system' })).headers.get('etag'), after.headers.get('etag'));
+    assert.equal((await manage(path, 'PUT', patch)).status, 400);
+    const replacement = { ...body, ...patch }; delete replacement.inverterId;
+    const put = await manage(path, 'PUT', replacement);
+    assert.equal(put.status, 200);
+    if (resource === 'installations') assert.equal(put.body.inverterId, undefined);
+    assert.equal((await manage(path, 'PUT', replacement)).headers.get('etag'), put.headers.get('etag'));
+    const collection = await request(`/${resource}`, { role: 'system' });
+    const staleDelete = await manage(path, 'DELETE', undefined, { 'If-Match': '"stale"' });
+    assert.equal(staleDelete.status, 412);
+    assert.equal((await request(path, { role: 'system' })).status, 200);
+    const deleted = await manage(path, 'DELETE');
+    assert.equal(deleted.status, 204); assert.equal(deleted.text, '');
+    assert.equal((await manage(path, 'DELETE')).status, 404);
+    assert.equal((await request(`/${resource}`, { role: 'system', headers: { 'If-None-Match': collection.headers.get('etag') } })).status, 200);
+  }
+});
+
+test('management relationship/history conflicts, uniqueness and deactivation', async () => {
+  const manage = (path, method, body) => request(path, { role: 'system', method, body });
+  for (const path of [`/provinces/${p1.id}`, `/districts/${d1.id}`, `/substations/${s1.id}`, `/installations/${i1.id}`])
+    assert.equal((await manage(path, 'DELETE')).status, 409);
+  assert.equal((await manage(`/districts/${d1.id}`, 'PATCH', { province: p2.id })).status, 409);
+  assert.equal((await manage(`/substations/${s1.id}`, 'PATCH', { district: d3.id })).status, 409);
+  for (const body of [{ substation: s2.id }, { installationId: 'REASSIGNED' }, { meterId: 'REASSIGNED' }, { inverterId: 'REASSIGNED' }])
+    assert.equal((await manage(`/installations/${i1.id}`, 'PATCH', body)).status, 409);
+  for (const [resource, body] of [['districts', { name: 'Orphan', province: new mongoose.Types.ObjectId().toString() }], ['substations', { name: 'Orphan', code: 'ORPHAN', district: p1.id }], ['installations', { installationId: 'ORPHAN', meterId: 'ORPHAN', ownerName: 'Orphan', capacityKw: 1, substation: p1.id }]])
+    assert.equal((await manage(`/${resource}`, 'POST', body)).status, 400);
+  assert.equal((await manage('/provinces', 'POST', { name: 'Duplicate', code: p1.code.toLowerCase() })).status, 409);
+  assert.equal((await manage('/districts', 'POST', { name: d1.name, province: p1.id })).status, 409);
+  assert.equal((await manage(`/installations/${i1.id}`, 'PATCH', { active: 'false' })).status, 400);
+  assert.equal((await manage(`/installations/${i1.id}`, 'PATCH', { capacityKw: '5' })).status, 400);
+  assert.equal((await manage(`/installations/${i1.id}`, 'PATCH', { lastKnownReading: null })).status, 400);
+  const old = await request(`/installations/${i1.id}`);
+  assert.equal((await manage(`/provinces/${p1.id}`, 'PATCH', { name: 'Renamed Western' })).status, 200);
+  assert.equal((await request(`/installations/${i1.id}`, { headers: { 'If-None-Match': old.headers.get('etag') } })).status, 200);
+  const count = await GenerationReading.countDocuments({ installation: i1._id });
+  assert.equal((await manage(`/installations/${i1.id}`, 'PATCH', { active: false })).status, 200);
+  assert.equal((await request(`/installations/${i1.id}/readings`, { role: 'device', method: 'POST', body: { timestamp: new Date().toISOString(), powerKw: 1, cumulativeEnergyKwh: 200, voltage: 230 } })).status, 403);
+  assert.equal(await GenerationReading.countDocuments({ installation: i1._id }), count);
+  assert.equal((await manage(`/installations/${i1.id}`, 'DELETE')).status, 409);
+  assert.equal((await manage(`/installations/${i1.id}`, 'PATCH', { active: true })).status, 200);
+  const empty = await SolarInstallation.create({ installationId: 'DEVICE-ONLY', meterId: 'DEVICE-ONLY', ownerName: 'Test', capacityKw: 1, substation: s1._id });
+  const device = await User.create({ name: 'Device only', email: 'device-only@test.lk', passwordHash: 'unused', role: 'DEVICE', jurisdictionType: 'INSTALLATION', jurisdictionModel: 'SolarInstallation', jurisdictionRef: empty._id });
+  assert.equal((await manage(`/installations/${empty.id}`, 'DELETE')).status, 409);
+  assert.equal((await manage(`/installations/${empty.id}`, 'PATCH', { meterId: 'CHANGED' })).status, 409);
+  await User.deleteOne({ _id: device._id }); await SolarInstallation.deleteOne({ _id: empty._id });
+});
+
+test('concurrent stale conditional management writes permit only one winner', async () => {
+  const province = await Province.create({ name: 'Concurrent', code: 'CONCURRENT' });
+  const path = `/provinces/${province.id}`;
+  const first = await request(path, { role: 'system' });
+  const results = await Promise.all(['A', 'B'].map(name => request(path, { role: 'system', method: 'PATCH', body: { name }, headers: { 'If-Match': first.headers.get('etag') } })));
+  assert.deepEqual(results.map(r => r.status).sort(), [200, 412]);
+  await Province.deleteOne({ _id: province._id });
+});
+
+test('empty resources may move parents but account-only references block deletion and moves', async () => {
+  const manage = (path, method, body) => request(path, { role: 'system', method, body });
+  const province = await Province.create({ name: 'Scoped empty province', code: 'SCOPED-EMPTY' });
+  const district = await District.create({ name: 'Scoped empty district', province: province._id });
+  const sub = await GridSubstation.create({ name: 'Scoped empty grid', code: 'SCOPED-EMPTY', district: district._id });
+  const installation = await SolarInstallation.create({ installationId: 'MOVABLE', meterId: 'MOVABLE', ownerName: 'Test', capacityKw: 1, substation: sub._id });
+  const moved = await manage(`/installations/${installation.id}`, 'PATCH', { substation: s2.id, meterId: 'MOVED-METER' });
+  assert.equal(moved.status, 200); assert.equal(moved.body.substation._id, s2.id);
+  assert.equal((await manage(`/installations/${installation.id}`, 'DELETE')).status, 204);
+  assert.equal((await manage(`/substations/${sub.id}`, 'PATCH', { district: d2.id })).status, 200);
+  const account = await User.create({ name: 'Scoped fixture', email: 'scoped-fixture@test.lk', passwordHash: 'unused', role: 'SUBSTATION_OFFICER', jurisdictionType: 'SUBSTATION', jurisdictionModel: 'GridSubstation', jurisdictionRef: sub._id, active: false });
+  assert.equal((await manage(`/substations/${sub.id}`, 'DELETE')).status, 409);
+  assert.equal((await manage(`/substations/${sub.id}`, 'PATCH', { district: d1.id })).status, 409);
+  await User.deleteOne({ _id: account._id });
+  assert.equal((await manage(`/substations/${sub.id}`, 'DELETE')).status, 204);
+  assert.equal((await manage(`/districts/${district.id}`, 'PATCH', { province: p2.id })).status, 200);
+  const districtUser = await User.create({ name: 'Scoped district', email: 'scoped-district@test.lk', passwordHash: 'unused', role: 'DISTRICT_OFFICER', jurisdictionType: 'DISTRICT', jurisdictionModel: 'District', jurisdictionRef: district._id });
+  assert.equal((await manage(`/districts/${district.id}`, 'DELETE')).status, 409);
+  assert.equal((await manage(`/districts/${district.id}`, 'PATCH', { province: p1.id })).status, 409);
+  await User.deleteOne({ _id: districtUser._id });
+  assert.equal((await manage(`/districts/${district.id}`, 'DELETE')).status, 204);
+  const provinceUser = await User.create({ name: 'Scoped province', email: 'scoped-province@test.lk', passwordHash: 'unused', role: 'PROVINCE_OFFICER', jurisdictionType: 'PROVINCE', jurisdictionModel: 'Province', jurisdictionRef: province._id });
+  assert.equal((await manage(`/provinces/${province.id}`, 'DELETE')).status, 409);
+  await User.deleteOne({ _id: provinceUser._id });
+  assert.equal((await manage(`/provinces/${province.id}`, 'DELETE')).status, 204);
+});
+
+test('management authentication never confers ingestion or reading mutation permissions', async () => {
+  const login = await request('/auth/login', { role: 'none', method: 'POST', body: { email: 'system@test.lk', password: 'TestPass123!' } });
+  assert.equal(login.status, 200); assert.equal(login.body.user.role, 'SYSTEM_ADMIN');
+  const path = `/installations/${i1.id}/readings`;
+  assert.equal((await request(path, { role: 'system', method: 'POST', body: { timestamp: new Date().toISOString(), powerKw: 1, cumulativeEnergyKwh: 200, voltage: 230 } })).status, 403);
+  for (const url of [path, `${path}/${r1.id}`, '/readings']) {
+    for (const method of ['PUT', 'PATCH', 'DELETE']) {
+      const result = await request(url, { role: 'system', method, ...(method === 'DELETE' ? {} : { body: {} }) });
+      assert.equal(result.status, 405); assert.match(result.headers.get('allow'), /GET/);
+      assert.ok(!/PUT|PATCH|DELETE/.test(result.headers.get('allow')));
+    }
+  }
+  assert.equal((await request(`/substations/${s1.id}`, { role: 'system', method: 'PATCH', body: { code: s2.code } })).status, 409);
+  assert.equal((await request(`/installations/${i1.id}`, { role: 'system', method: 'PATCH', body: { meterId: i2.meterId } })).status, 409);
+});
+
+test('offline provisioning creates a separate hashed account and cannot elevate existing readers', async () => {
+  const { provision } = require('../scripts/provision-system-admin');
+  const original = await User.findOne({ email: 'admin@test.lk' }).lean();
+  await assert.rejects(provision({ name: 'Test', email: original.email, password: 'unique-test-password-1234' }), error => error.code === 11000);
+  assert.equal((await User.findById(original._id)).role, 'ADMIN');
+  await assert.rejects(provision({ name: 'Test', email: 'new@test.lk', password: 'short' }));
+  const user = await provision({ name: 'Provisioned', email: 'provisioned@test.lk', password: 'unique-test-password-1234' });
+  assert.equal(user.role, 'SYSTEM_ADMIN'); assert.equal(user.jurisdictionType, 'NATIONAL');
+  assert.equal(user.jurisdictionRef, undefined);
+  assert.ok(await bcrypt.compare('unique-test-password-1234', user.passwordHash));
+  assert.notEqual(user.passwordHash, 'unique-test-password-1234');
+});
+
+test('collection deletion updates persisted date validation even when the newest member is removed', async () => {
+  const Revision = mongoose.model('ManagementCacheRevision');
+  const saved = await Province.find().lean();
+  const revision = await Revision.findById('management').lean();
+  const province = await Province.create({ name: 'Date deletion', code: 'DATE-DELETION' });
+  try {
+    await Province.collection.updateMany({}, { $set: { createdAt: new Date('2020-01-01'), updatedAt: new Date('2020-01-01') } });
+    await Province.collection.updateOne({ _id: province._id }, { $set: { updatedAt: new Date('2021-01-01') } });
+    await Revision.updateOne({ _id: 'management' }, { $set: { modified: new Date('2020-01-01') } });
+    const first = await request('/provinces', { role: 'system' });
+    assert.equal(first.headers.get('last-modified'), 'Fri, 01 Jan 2021 00:00:00 GMT');
+    assert.equal((await request('/provinces', { role: 'system', headers: { 'If-Modified-Since': first.headers.get('last-modified') } })).status, 304);
+    assert.equal((await request(`/provinces/${province.id}`, { role: 'system', method: 'DELETE' })).status, 204);
+    const next = await request('/provinces', { role: 'system', headers: { 'If-Modified-Since': first.headers.get('last-modified') } });
+    assert.equal(next.status, 200);
+    assert.notEqual(next.headers.get('etag'), first.headers.get('etag'));
+    assert.ok(Date.parse(next.headers.get('last-modified')) > Date.parse(first.headers.get('last-modified')));
+  } finally {
+    await Province.collection.bulkWrite(saved.map(item => ({ updateOne: { filter: { _id: item._id }, update: { $set: { createdAt: item.createdAt, updatedAt: item.updatedAt } } } })));
+    await Revision.updateOne({ _id: 'management' }, { $set: { modified: revision.modified } });
+    await Province.deleteOne({ _id: province._id });
   }
 });

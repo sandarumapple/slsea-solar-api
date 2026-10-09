@@ -41,6 +41,7 @@ function query(value) {
   };
 }
 test('district collection applies the authorized district filter', async (t) => {
+  t.mock.method(require('../src/utils/managementCache'), 'modified', async () => 0);
   let filter;
   t.mock.method(models.District, 'find', (q) => {
     filter = q;

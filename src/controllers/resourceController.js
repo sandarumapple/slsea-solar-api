@@ -7,6 +7,9 @@ const {
 } = require('../models');
 const { ApiError, notFound } = require('../utils/errors');
 const { send, paginate, timestamp, latestModification } = require('../utils/http');
+async function sendCollection(req, res, value) {
+  return send(req, res, value, await require('../utils/managementCache').modified(value));
+}
 const hierarchy = {
   path: 'substation',
   populate: { path: 'district', populate: { path: 'province' } }
@@ -15,7 +18,7 @@ const hierarchy = {
 exports.myContext = async (req, res) => {
   const user = req.auth;
   let resource = null;
-  if (user.role !== 'ADMIN') {
+  if (!['ADMIN', 'SYSTEM_ADMIN'].includes(user.role)) {
     const assigned = {
       PROVINCE_OFFICER: { model: Province, key: 'provinces' },
       DISTRICT_OFFICER: { model: District, key: 'districts', populate: 'province' },
@@ -53,7 +56,7 @@ exports.myContext = async (req, res) => {
 };
 
 exports.provinces = async (req, res) =>
-  send(
+  sendCollection(
     req,
     res,
     await Province.find({ _id: { $in: req.scope.provinces } })
@@ -63,7 +66,7 @@ exports.provinces = async (req, res) =>
 exports.province = async (req, res) =>
   send(req, res, await Province.findById(req.params.provinceId).lean());
 exports.districts = async (req, res) =>
-  send(
+  sendCollection(
     req,
     res,
     await District.find({
@@ -81,7 +84,7 @@ exports.district = async (req, res) =>
     await District.findById(req.params.districtId).populate('province').lean()
   );
 exports.substations = async (req, res) =>
-  send(
+  sendCollection(
     req,
     res,
     await GridSubstation.find({
@@ -101,7 +104,7 @@ exports.substation = async (req, res) =>
       .lean()
   );
 exports.installations = async (req, res) =>
-  send(
+  sendCollection(
     req,
     res,
     await SolarInstallation.find({
@@ -240,7 +243,11 @@ exports.readings = async (req, res) => {
   );
 };
 
-exports.createReading = async (req, res) => {
+exports.createReading = async (req, res) => require('../utils/writeLock')(async () => {
+  // Authorization loaded this document before waiting; refresh under the write lock.
+  req.installation = await SolarInstallation.findById(req.params.installationId);
+  if (!req.installation) throw notFound('Installation');
+  if (String(req.auth.jurisdictionRef) !== String(req.installation._id)) throw new ApiError(403, 'FORBIDDEN', 'Outside your jurisdiction');
   if (!req.installation.active)
     throw new ApiError(403, 'FORBIDDEN', 'Installation is inactive');
   const {
@@ -289,7 +296,7 @@ exports.createReading = async (req, res) => {
       );
     throw error;
   }
-};
+});
 
 exports.summary = async (req, res) => {
   const subs = await GridSubstation.find({

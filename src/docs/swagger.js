@@ -407,3 +407,26 @@ module.exports.components.schemas.ReadingInput.example = {
 module.exports.components.schemas.Error.example = {
   code: 'FORBIDDEN', message: 'Outside your jurisdiction', detail: 'Outside your jurisdiction'
 };
+
+// Management is an explicit extension; ADMIN remains a national reader.
+for (const [resource, definition] of Object.entries(require('../controllers/managementController').definitions)) {
+  const schemaName = { provinces: 'Province', districts: 'District', substations: 'Substation', installations: 'InstallationComposite' }[resource];
+  const properties = Object.fromEntries(definition.fields.map(field => [field,
+    field === 'active' ? { type: 'boolean' } : field === 'capacityKw' ? { type: 'number', minimum: 0.1 } : field === definition.parent?.[0] ? id : { type: 'string', minLength: 1 }
+  ]));
+  for (const method of ['post', 'put', 'patch', 'delete']) {
+    const path = method === 'post' ? `/${resource}` : `/${resource}/{${definition.parameter}}`;
+    const input = { type: 'object', additionalProperties: false, properties, minProperties: 1 };
+    if (method !== 'patch') input.required = definition.fields.filter(field => !(definition.optional || []).includes(field) && !(method === 'post' && field === 'active'));
+    paths[path][method] = {
+      tags: ['Management'], summary: `${method.toUpperCase()} ${resource}`,
+      description: 'SYSTEM_ADMIN only. JSON object PATCH updates supplied fields (not JSON Patch or Merge Patch; null is rejected). PUT replaces all editable fields; omitted inverterId is removed. Parent references must exist. Deletion conflicts with children/readings/scoped accounts. District/substation parent changes conflict with children or scoped accounts. Installation identity (installationId, meterId, inverterId) and parent changes conflict with readings or device accounts. PATCH active=false deactivates without erasing history. Repeated DELETE returns 404. Writes and ingestion are serialized within one API process only; multiple processes/direct database writers require external coordination.',
+      parameters: method === 'post' ? [] : conditionalParameters.filter(p => ['If-Match', 'If-Unmodified-Since', 'If-None-Match'].includes(p.name)),
+      ...(method === 'delete' ? {} : { requestBody: { required: true, content: { 'application/json': { schema: input } } } }),
+      responses: {
+        [method === 'post' ? 201 : method === 'delete' ? 204 : 200]: response(method === 'delete' ? 'Deleted; empty body' : 'Current GET representation', method === 'delete' ? null : ref(schemaName), { headers: { ...headers, ...(method === 'post' ? { Location: { schema: string } } : {}) } }),
+        ...errors, 409: error('Unique constraint or relationship/history conflict'), 415: error('application/json required')
+      }
+    };
+  }
+}

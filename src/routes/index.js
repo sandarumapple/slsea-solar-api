@@ -116,6 +116,14 @@ router.post(
   c.createReading
 );
 
+const management = require('../controllers/managementController');
+for (const [resource, definition] of Object.entries(management.definitions)) {
+  const permissions = [authenticate, requireRoles('SYSTEM_ADMIN')];
+  router.post(`/${resource}`, ...permissions, management.handler(resource));
+  for (const method of ['put', 'patch', 'delete'])
+    router[method](`/${resource}/:${definition.parameter}`, ...permissions, management.handler(resource));
+}
+
 // Readings are append-only. Known resources report unsupported methods explicitly.
 const methods = new Map();
 for (const layer of router.stack) {
@@ -136,7 +144,7 @@ for (const [path, verbs] of methods) {
         405,
         'METHOD_NOT_ALLOWED',
         'Method not supported for this resource',
-        'Generation readings are append-only; SLSEA users are read-only.'
+        'Generation readings are append-only; management writes require SYSTEM_ADMIN.'
       )
     );
   });
